@@ -21,6 +21,17 @@ STATE_FILE = ".pr_state.yaml"
 
 # ── Config + State ────────────────────────────────────────────────────────────
 
+_git_client = None
+
+def get_git_client(org_url: str):
+    """Only initialize connection when actually needed (not during dry run)."""
+    global _git_client
+    if _git_client is None:
+        credentials  = BasicAuthentication("", PAT)
+        connection   = Connection(base_url=org_url, creds=credentials)
+        _git_client  = connection.clients.get_git_client()
+    return _git_client
+    
 def load_config(path: str = "config/repos.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -391,14 +402,13 @@ def process_repo(
     repo_cfg: dict,
     timestamp: str,
     global_cfg: dict,
-    git_client,
     state: dict,
     args: argparse.Namespace,
 ):
-    repo_name     = repo_cfg["name"]
-    files         = repo_cfg.get("files", [])
-    branch_groups = repo_cfg.get("branch_groups", [])
-    catch_all     = global_cfg["defaults"]["catch_all_branch_prefix"]
+    repo_name       = repo_cfg["name"]
+    files           = repo_cfg.get("files", [])
+    branch_groups   = repo_cfg.get("branch_groups", [])
+    catch_all       = global_cfg["defaults"]["catch_all_branch_prefix"]
     ssh_remote_base = global_cfg["git"]["ssh_remote_base"]
 
     target_branches = filter_branches(
@@ -424,10 +434,13 @@ def process_repo(
         print(f"  ⚠  No matching groups, skipping.")
         return
 
+    # ⬇ dry run exits here — no network calls made at all
     if args.dry_run:
         print_dry_run_plan(repo_name, grouped_files, target_branches, state)
         return
 
+    # ⬇ only initialized when actually needed
+    git_client = get_git_client(global_cfg["azure"]["org_url"])
     local_path = clone_or_fetch(repo_name, ssh_remote_base)
 
     for base_branch in target_branches:
