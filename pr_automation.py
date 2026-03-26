@@ -8,7 +8,11 @@ from datetime import datetime
 
 import yaml
 from azure.devops.connection import Connection
-from azure.devops.v7_0.git.models import GitPullRequestToCreate
+from azure.devops.v7_1.git.models import (
+    GitPullRequestToCreate,
+    GitPullRequestSearchCriteria,
+)
+from azure.devops.v7_1.git.models import IdentityRefWithVote
 from dotenv import load_dotenv
 from msrest.authentication import BasicAuthentication
 
@@ -19,19 +23,61 @@ REPOS_ROOT = os.path.abspath(os.environ.get("REPOS_ROOT", "/tmp/cloned_repos"))
 STATE_FILE = ".pr_state.yaml"
 
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+class Step:
+    """Simple enumerated step logger scoped per repo+branch+group context."""
+
+    def __init__(self):
+        self._count = 0
+
+    def reset(self):
+        self._count = 0
+
+    def log(self, msg: str):
+        self._count += 1
+        print(f"      {self._count}. {msg}")
+
+    def warn(self, msg: str):
+        self._count += 1
+        print(f"      {self._count}. ⚠  {msg}")
+
+    def ok(self, msg: str):
+        self._count += 1
+        print(f"      {self._count}. ✅ {msg}")
+
+    def error(self, msg: str):
+        self._count += 1
+        print(f"      {self._count}. ❌ {msg}")
+
+
+step = Step()
+
+
+def section(title: str):
+    """Top level section header."""
+    print(f"\n{'═' * 60}")
+    print(f"  {title}")
+    print(f"{'═' * 60}")
+
+
+def subsection(title: str):
+    """Branch level header."""
+    print(f"\n  {'─' * 55}")
+    print(f"  {title}")
+    print(f"  {'─' * 55}")
+
+
+def group_header(group: str):
+    print(f"\n    ┌─ Group : {group}")
+
+
+def group_footer(group: str):
+    print(f"    └─ Done  : {group}")
+
+
 # ── Config + State ────────────────────────────────────────────────────────────
 
-_git_client = None
-
-def get_git_client(org_url: str):
-    """Only initialize connection when actually needed (not during dry run)."""
-    global _git_client
-    if _git_client is None:
-        credentials  = BasicAuthentication("", PAT)
-        connection   = Connection(base_url=org_url, creds=credentials)
-        _git_client  = connection.clients.get_git_client()
-    return _git_client
-    
 def load_config(path: str = "config/repos.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -60,17 +106,14 @@ examples:
   # run everything
   python raise_pr.py
 
+  # dry run — see plan without making any changes
+  python raise_pr.py --dry-run
+
   # single repo, all groups, all branches
   python raise_pr.py --repo configartifacts
 
-  # single repo, single group, all branches
-  python raise_pr.py --repo configartifacts --group IBOR
-
   # single repo, single group, single branch
   python raise_pr.py --repo configartifacts --group IBOR --branch develop
-
-  # single repo, all groups, single branch
-  python raise_pr.py --repo configartifacts --branch main
 
   # multiple repos
   python raise_pr.py --repo configartifacts --repo aladdindb
@@ -79,7 +122,6 @@ examples:
   python raise_pr.py --repo configartifacts --group IBOR --group REF
         """,
     )
-
     parser.add_argument(
         "--repo",
         dest="repos",
@@ -106,7 +148,6 @@ examples:
         action="store_true",
         help="Resolve groups and print plan without making any changes.",
     )
-
     return parser.parse_args()
 
 
@@ -162,23 +203,27 @@ def group_files(
     for entry in files:
         group = resolve_group(entry["dst"], branch_groups, catch_all)
         grouped[group].append(entry)
-        print(f"    [{group}] ← {entry['dst']}")
     return dict(grouped)
 
 
 # ── Git helpers (SSH) ─────────────────────────────────────────────────────────
 
-def get_env():
-    """Build env for subprocess git calls, injecting SSH command if set."""
+def get_env() -> dict:
     env = os.environ.copy()
     git_ssh = os.environ.get("GIT_SSH_COMMAND")
     if git_ssh:
         env["GIT_SSH_COMMAND"] = git_ssh
     return env
-    
+
+
 def run(cmd: list[str], cwd: str = None) -> str:
     result = subprocess.run(
-        cmd, cwd=cwd, check=True, capture_output=True, text=True, env=get_env(),
+        cmd,
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=get_env(),
     )
     return result.stdout.strip()
 
@@ -192,31 +237,43 @@ def clone_or_fetch(repo_name: str, ssh_remote_base: str) -> str:
     ssh_url    = get_ssh_url(ssh_remote_base, repo_name)
 
     if not os.path.exists(local_path):
-        print(f"    Cloning {repo_name} via SSH...")
+        step.log(f"Cloning '{repo_name}' via SSH into {local_path}")
         run(["git", "clone", ssh_url, local_path])
+        step.ok(f"Clone successful")
     else:
-        print(f"    Fetching latest for {repo_name}...")
+        step.log(f"Repo '{repo_name}' exists locally, fetching all remotes...")
         run(["git", "fetch", "--all"], cwd=local_path)
+        step.ok(f"Fetch successful")
 
     return local_path
 
 
 def prepare_branch(local_path: str, base_branch: str, new_branch: str):
-    print(f"    Checking out '{base_branch}' and pulling latest...")
+    step.log(f"Checking out '{base_branch}'")
     run(["git", "checkout", base_branch], cwd=local_path)
+
+    step.log(f"Pulling latest from origin/{base_branch}")
     run(["git", "pull", "origin", base_branch], cwd=local_path)
-    print(f"    Cutting branch: {new_branch}")
+    step.ok(f"Up to date with origin/{base_branch}")
+
+    step.log(f"Cutting new branch '{new_branch}' from '{base_branch}'")
     run(["git", "checkout", "-b", new_branch], cwd=local_path)
+    step.ok(f"Branch '{new_branch}' ready")
 
 
 def checkout_existing_branch(
     local_path: str, branch: str, base_branch: str
 ):
-    print(f"    Checking out existing branch: {branch}")
+    step.log(f"Switching to base '{base_branch}' before fetching feature branch")
     run(["git", "checkout", base_branch], cwd=local_path)
+
+    step.log(f"Fetching existing branch '{branch}' from origin")
     run(["git", "fetch", "origin", branch], cwd=local_path)
     run(["git", "checkout", branch], cwd=local_path)
+
+    step.log(f"Pulling latest commits on '{branch}'")
     run(["git", "pull", "origin", branch], cwd=local_path)
+    step.ok(f"Checked out and up to date on '{branch}'")
 
 
 def copy_files(files: list[dict], repo_local_path: str) -> list[str]:
@@ -226,12 +283,13 @@ def copy_files(files: list[dict], repo_local_path: str) -> list[str]:
         dst = os.path.join(repo_local_path, entry["dst"])
 
         if not os.path.exists(src):
-            print(f"    ⚠  Source not found, skipping: {entry['src']}")
+            step.warn(f"Source not found, skipping: {entry['src']}")
             continue
 
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
-        print(f"    Copied: {entry['src']}  →  {entry['dst']}")
+        step.log(f"Copied: {entry['src']}")
+        step.log(f"    └─► {entry['dst']}")
         copied.append(entry["dst"])
 
     return copied
@@ -243,13 +301,30 @@ def has_changes(repo_local_path: str) -> bool:
 
 
 def commit_and_push(repo_local_path: str, branch: str, message: str):
+    step.log("Staging all changes (git add .)")
     run(["git", "add", "."], cwd=repo_local_path)
+
+    step.log(f"Committing with message: '{message}'")
     run(["git", "commit", "-m", message], cwd=repo_local_path)
+
+    step.log(f"Pushing branch '{branch}' to origin")
     run(["git", "push", "origin", branch], cwd=repo_local_path)
-    print(f"    Pushed to branch: {branch}")
+    step.ok(f"Push successful → origin/{branch}")
 
 
 # ── PR helpers ────────────────────────────────────────────────────────────────
+
+_git_client = None
+
+
+def get_git_client(org_url: str):
+    global _git_client
+    if _git_client is None:
+        credentials = BasicAuthentication("", PAT)
+        connection  = Connection(base_url=org_url, creds=credentials)
+        _git_client = connection.clients.get_git_client()
+    return _git_client
+
 
 def is_pr_still_open(
     git_client, project: str, repo_name: str, pr_id: int
@@ -267,14 +342,20 @@ def raise_pr(
     target_branch: str,
     title: str,
     org_url: str,
+    reviewers: list[str],
 ) -> int:
     repo = git_client.get_repository(repo_name, project=project)
+
+    reviewer_refs = [
+        IdentityRefWithVote(id=guid) for guid in reviewers
+    ] if reviewers else []
 
     pr_payload = GitPullRequestToCreate(
         title=title,
         description="Automated PR — please review and merge manually.",
         source_ref_name=f"refs/heads/{source_branch}",
         target_ref_name=f"refs/heads/{target_branch}",
+        reviewers=reviewer_refs,
     )
 
     created = git_client.create_pull_request(
@@ -284,7 +365,11 @@ def raise_pr(
         f"{org_url}/{project}/_git/{repo_name}"
         f"/pullrequest/{created.pull_request_id}"
     )
-    print(f"    ✅ PR #{created.pull_request_id} raised → {pr_url}")
+    step.ok(f"PR #{created.pull_request_id} raised successfully")
+    step.log(f"URL → {pr_url}")
+    if reviewers:
+        step.log(f"Reviewers assigned: {len(reviewers)}")
+
     return created.pull_request_id
 
 
@@ -295,29 +380,52 @@ def print_dry_run_plan(
     grouped_files: dict[str, list[dict]],
     target_branches: list[str],
     state: dict,
+    reviewers: list[str],
 ):
-    print(f"\n  {'─' * 50}")
-    print(f"  DRY RUN — Repo: {repo_name}")
     for base_branch in target_branches:
-        print(f"\n    Target branch: {base_branch}")
+        subsection(f"DRY RUN | {repo_name} → {base_branch}")
+        i = 0
         for group, files in grouped_files.items():
-            state_entry = (
-                state
-                .get(repo_name, {})
-                .get(group, {})
-                .get(base_branch, {})
+            state_entry    = (
+                state.get(repo_name, {}).get(group, {}).get(base_branch, {})
             )
             existing_pr = state_entry.get("pr_id")
             existing_br = state_entry.get("branch")
 
-            if existing_pr:
-                action = f"AMEND   → push to existing branch '{existing_br}' (PR #{existing_pr})"
-            else:
-                action = f"NEW PR  → cut branch 'auto/{group}-{base_branch}-<timestamp>'"
+            group_header(group)
 
-            print(f"      [{group}] {action}")
+            i += 1
+            if existing_pr:
+                print(
+                    f"      {i}. ACTION  : AMEND existing PR"
+                )
+                print(
+                    f"      {i}. Branch  : {existing_br}"
+                )
+                print(
+                    f"      {i}. PR      : #{existing_pr}"
+                )
+            else:
+                print(
+                    f"      {i}. ACTION  : NEW branch + PR"
+                )
+                print(
+                    f"      {i}. Branch  : auto/{group}-{base_branch}-<timestamp>"
+                )
+
+            i += 1
+            print(f"      {i}. Files   :")
             for f in files:
-                print(f"        {f['src']}  →  {f['dst']}")
+                print(f"           {f['src']}")
+                print(f"           └─► {f['dst']}")
+
+            if reviewers:
+                i += 1
+                print(f"      {i}. Reviewers ({len(reviewers)}):")
+                for r in reviewers:
+                    print(f"           • {r}")
+
+            group_footer(group)
 
 
 # ── Per group logic ───────────────────────────────────────────────────────────
@@ -332,11 +440,12 @@ def process_group(
     state: dict,
     git_client,
     global_cfg: dict,
+    reviewers: list[str],
 ):
     org_url = global_cfg["azure"]["org_url"]
     project = global_cfg["azure"]["project"]
 
-    state_entry    = (
+    state_entry     = (
         state
         .setdefault(repo_name, {})
         .setdefault(group, {})
@@ -346,21 +455,25 @@ def process_group(
     existing_pr_id  = state_entry.get("pr_id")
     is_amendment    = False
 
+    # ── Step 1: determine branch strategy ────────────────────────────────────
+    step.log("Checking for existing open PR in state...")
     if existing_branch and existing_pr_id:
         if is_pr_still_open(git_client, project, repo_name, existing_pr_id):
-            print(
-                f"    Open PR #{existing_pr_id} found, "
-                f"amending existing branch..."
+            step.log(
+                f"Open PR #{existing_pr_id} found on '{existing_branch}'"
+                f" — will amend"
             )
             checkout_existing_branch(local_path, existing_branch, base_branch)
             is_amendment = True
         else:
-            print(
-                f"    PR #{existing_pr_id} is closed/merged, "
-                f"creating fresh branch..."
+            step.log(
+                f"PR #{existing_pr_id} is closed/merged"
+                f" — will create fresh branch"
             )
             existing_branch = None
             existing_pr_id  = None
+    else:
+        step.log("No existing PR found — will create new branch + PR")
 
     if not is_amendment:
         new_branch = f"auto/{group}-{base_branch}-{timestamp}"
@@ -368,39 +481,51 @@ def process_group(
     else:
         new_branch = existing_branch
 
+    # ── Step 2: copy files ────────────────────────────────────────────────────
+    step.log(f"Copying {len(files)} file(s) into repo...")
     copy_files(files, local_path)
 
+    # ── Step 3: check diff ────────────────────────────────────────────────────
+    step.log("Checking git diff...")
     if not has_changes(local_path):
-        print(
-            f"    ⚠  No changes detected for "
-            f"group '{group}' → '{base_branch}', skipping."
+        step.warn(
+            f"No changes detected after copy — skipping PR for"
+            f" group '{group}' → '{base_branch}'"
         )
         run(["git", "checkout", base_branch], cwd=local_path)
         if not is_amendment:
             run(["git", "branch", "-D", new_branch], cwd=local_path)
         return
+    step.ok("Changes detected — proceeding")
 
+    # ── Step 4: commit + push ─────────────────────────────────────────────────
     commit_msg = (
-        f"chore({group}): {'amend' if is_amendment else 'initial'} "
-        f"changes → {base_branch} [{timestamp}]"
+        f"chore({group}): {'amend' if is_amendment else 'initial'}"
+        f" changes → {base_branch} [{timestamp}]"
     )
     commit_and_push(local_path, new_branch, commit_msg)
 
+    # ── Step 5: raise PR or log amendment ────────────────────────────────────
     if not is_amendment:
+        step.log("Raising PR in Azure DevOps...")
         pr_title = (
             f"[AUTO] {repo_name}/{group} → {base_branch} | {timestamp}"
         )
         pr_id = raise_pr(
             git_client, project, repo_name,
             new_branch, base_branch, pr_title, org_url,
+            reviewers,
         )
         state[repo_name][group][base_branch] = {
             "branch": new_branch,
             "pr_id":  pr_id,
         }
     else:
-        print(f"    ✅ Amendment pushed to PR #{existing_pr_id}")
+        step.ok(
+            f"Amendment pushed — PR #{existing_pr_id} updated automatically"
+        )
 
+    # return to base so next group starts clean
     run(["git", "checkout", base_branch], cwd=local_path)
 
 
@@ -418,48 +543,62 @@ def process_repo(
     branch_groups   = repo_cfg.get("branch_groups", [])
     catch_all       = global_cfg["defaults"]["catch_all_branch_prefix"]
     ssh_remote_base = global_cfg["git"]["ssh_remote_base"]
+    reviewers       = repo_cfg.get("reviewers", [])
 
     target_branches = filter_branches(
         repo_cfg.get("target_branches", ["develop"]), args.branches
     )
 
-    print(f"\n{'─' * 55}")
-    print(f"  Repo : {repo_name}")
+    section(f"Repo : {repo_name}")
 
     if not files:
-        print(f"  ⚠  No files configured, skipping.")
+        print("  ⚠  No files configured, skipping.")
         return
 
     if not target_branches:
-        print(f"  ⚠  No matching target branches, skipping.")
+        print("  ⚠  No matching target branches, skipping.")
         return
 
-    print(f"\n  Resolving file groups...")
+    # ── Resolve + print group plan ────────────────────────────────────────────
+    print("\n  Resolving file → group mappings...")
     grouped_files = group_files(files, branch_groups, catch_all)
+    for grp, grp_files in grouped_files.items():
+        print(f"    [{grp}] — {len(grp_files)} file(s)")
+        for f in grp_files:
+            print(f"         {f['src']}")
+            print(f"         └─► {f['dst']}")
+
     grouped_files = filter_groups(grouped_files, args.groups)
 
     if not grouped_files:
-        print(f"  ⚠  No matching groups, skipping.")
+        print("  ⚠  No matching groups, skipping.")
         return
 
-    # ⬇ dry run exits here — no network calls made at all
     if args.dry_run:
-        print_dry_run_plan(repo_name, grouped_files, target_branches, state)
+        print_dry_run_plan(
+            repo_name, grouped_files, target_branches, state, reviewers
+        )
         return
 
-    # ⬇ only initialized when actually needed
     git_client = get_git_client(global_cfg["azure"]["org_url"])
+
+    # clone/fetch once per repo
+    print("\n  Initializing local repo...")
+    step.reset()
     local_path = clone_or_fetch(repo_name, ssh_remote_base)
 
     for base_branch in target_branches:
-        print(f"\n  Target branch : {base_branch}")
+        subsection(f"{repo_name} → {base_branch}")
         for group, group_file_list in grouped_files.items():
-            print(f"\n    Group : {group}")
+            group_header(group)
+            step.reset()
             process_group(
                 repo_name, group, group_file_list,
                 base_branch, timestamp, local_path,
                 state, git_client, global_cfg,
+                reviewers,
             )
+            group_footer(group)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -470,20 +609,21 @@ def main():
     state     = load_state()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    credentials = BasicAuthentication("", PAT)
-    connection  = Connection(
-        base_url=config["azure"]["org_url"], creds=credentials
-    )
-    git_client = connection.clients.get_git_client()
+    print("\n" + "═" * 60)
+    print("  PR Automation — Azure DevOps")
+    print(f"  Run timestamp : {timestamp}")
+    if args.dry_run:
+        print("  Mode          : DRY RUN (no changes will be made)")
+    print("═" * 60)
 
     repos = filter_repos(config["repos"], args.repos)
+    print(f"\n  Repos to process : {len(repos)}")
+    for r in repos:
+        print(f"    • {r['name']}")
 
     for repo_cfg in repos:
         try:
-            process_repo(
-                repo_cfg, timestamp, config,
-                git_client, state, args,
-            )
+            process_repo(repo_cfg, timestamp, config, state, args)
         except subprocess.CalledProcessError as e:
             print(f"\n  ❌ Git error for {repo_cfg['name']}: {e.stderr}")
         except Exception as e:
@@ -492,8 +632,9 @@ def main():
     if not args.dry_run:
         save_state(state)
 
-    print(f"\n{'─' * 55}")
-    print("  Done.")
+    print("\n" + "═" * 60)
+    print("  All done.")
+    print("═" * 60 + "\n")
 
 
 if __name__ == "__main__":
