@@ -1,0 +1,15 @@
+# start ssh-agent
+Start-Service ssh-agent                        # Windows (run once, as admin)
+# or on Linux/Mac:
+eval "$(ssh-agent -s)"
+
+# add your key (this is where you enter passphrase — once)
+ssh-add C:\Users\<user>\.ssh\id_rsa         # Windows
+# or
+ssh-add ~/.ssh/id_rsa                          # Linux/Mac
+
+# verify key is loaded
+ssh-add -l
+
+# now run the script — no passphrase prompt needed
+python scripts/raise_pr.py --repo configartifacts --group REF --branch develop
