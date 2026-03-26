@@ -60,7 +60,7 @@ repos:
       - src: staging/configartifacts/unmapped_file.yaml
         dst: unmapped_file.yaml        # no pattern matches → goes to misc branch
 
-  - name: aladdindb
+  - name: aladb
     target_branches:
       - develop
       - main
@@ -72,5 +72,5 @@ repos:
         pattern: "^schema/"
 
     files:
-      - src: staging/aladdindb/core/somefile.sql
+      - src: staging/aladb/core/somefile.sql
         dst: core/somefile.sql
