@@ -1,0 +1,76 @@
+azure:
+  org_url: https://dev.azure.com/yourorg
+  project: yourproject
+
+git:
+  ssh_remote_base: "git@ssh.dev.azure.com:v3/yourorg/yourproject"
+
+defaults:
+  catch_all_branch_prefix: "misc"   # unmatched files go to auto/misc-develop-TIMESTAMP
+
+repos:
+  - name: configartifacts
+    target_branches:
+      - develop
+      - main
+    # patterns are evaluated top-down, first match wins
+    # put more specific patterns first
+    branch_groups:
+      - group: IBOR
+        pattern: "^IBOR/"          # anything starting with IBOR/
+
+      - group: REF
+        pattern: "^REF/"
+
+      - group: ACT
+        pattern: "^ACT/"
+
+      - group: ALT
+        pattern: "^ALT/"
+
+      - group: ANR
+        pattern: "^ANR/"
+
+      - group: EDP
+        pattern: "^EDP/"
+
+      - group: ESG
+        pattern: "^ESG/"
+
+      - group: MKT
+        pattern: "^MKT/"
+
+      - group: ABOR
+        pattern: "^ABOR/"
+
+      # more specific example — same dir but different group based on depth
+      - group: IBOR-special
+        pattern: "^SOME_DIR/.*/IBOR$"   # IBOR appearing at end of path
+
+    files:
+      - src: staging/configartifacts/IBOR/datasets/file1.yaml
+        dst: IBOR/datasets/file1.yaml
+
+      - src: staging/configartifacts/IBOR/mappings/file2.yaml
+        dst: IBOR/mappings/file2.yaml
+
+      - src: staging/configartifacts/REF/datasets/file3.yaml
+        dst: REF/datasets/file3.yaml
+
+      - src: staging/configartifacts/unmapped_file.yaml
+        dst: unmapped_file.yaml        # no pattern matches → goes to misc branch
+
+  - name: aladdindb
+    target_branches:
+      - develop
+      - main
+    branch_groups:
+      - group: CORE
+        pattern: "^core/"
+
+      - group: SCHEMA
+        pattern: "^schema/"
+
+    files:
+      - src: staging/aladdindb/core/somefile.sql
+        dst: core/somefile.sql
