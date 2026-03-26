@@ -168,9 +168,17 @@ def group_files(
 
 # ── Git helpers (SSH) ─────────────────────────────────────────────────────────
 
+def get_env():
+    """Build env for subprocess git calls, injecting SSH command if set."""
+    env = os.environ.copy()
+    git_ssh = os.environ.get("GIT_SSH_COMMAND")
+    if git_ssh:
+        env["GIT_SSH_COMMAND"] = git_ssh
+    return env
+    
 def run(cmd: list[str], cwd: str = None) -> str:
     result = subprocess.run(
-        cmd, cwd=cwd, check=True, capture_output=True, text=True
+        cmd, cwd=cwd, check=True, capture_output=True, text=True, env=get_env(),
     )
     return result.stdout.strip()
 
