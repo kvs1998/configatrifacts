@@ -5,12 +5,12 @@ import shutil
 import subprocess
 from collections import defaultdict
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 from azure.devops.connection import Connection
 from azure.devops.v7_1.git.models import (
     GitPullRequestToCreate,
-    GitPullRequestSearchCriteria,
     IdentityRefWithVote,
 )
 from azure.devops.v7_1.work_item_tracking.models import JsonPatchOperation
@@ -35,24 +35,6 @@ DOMAIN_OPTIONS = [
     "MKT",
     "REF",
 ]
-
-BUILTIN_TEMPLATE = """\
-## Description
-
-{description}
-
-## Type of change
-
-- [ ] Bug fix
-- [ ] New feature
-- [ ] Configuration change
-- [ ] Other
-
-## Checklist
-
-- [ ] I have reviewed my own changes
-- [ ] I have added/updated documentation where necessary
-"""
 
 TEMPLATE_DESCRIPTION_PLACEHOLDER = (
     "Add a description of what is being changed, and why, "
@@ -130,72 +112,65 @@ def save_state(state: dict):
         yaml.dump(state, f, default_flow_style=False)
 
 
-def load_template(path: str | None) -> tuple[str, str]:
+def load_template(path: str) -> Optional[str]:
     """
-    Load a PR template from `path`.
-
-    Returns (template_text, source_label) where source_label is one of:
-      "repo-specific", "global", "built-in"
-
-    Resolution order:
-      1. path supplied (repo-level template_file)
-      2. built-in minimal template
+    Load template text from path.
+    Returns None if path does not exist (with a warning).
     """
-    if path:
-        if os.path.exists(path):
-            with open(path) as f:
-                return f.read(), path
-        else:
-            print(
-                f"  ⚠  Template file '{path}' not found"
-                f" — falling back to built-in template"
-            )
-    return BUILTIN_TEMPLATE, "built-in"
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.read()
+    print(f"  ⚠  Template file '{path}' not found — no template will be used")
+    return None
 
 
-def resolve_template(repo_cfg: dict, global_cfg: dict) -> tuple[str, str]:
+def resolve_template(
+    repo_cfg: dict, global_cfg: dict
+) -> Tuple[Optional[str], str]:
     """
     Resolve which template to use for a repo.
 
     Priority:
-      1. repo_cfg["template_file"]
-      2. global_cfg["template_file"]
-      3. built-in template
+      1. repo_cfg["template_file"]  — repo-specific
+      2. global_cfg["template_file"] — global fallback
+      3. None — no template; description will be auto-content only
+
+    Returns (template_text_or_None, source_label).
     """
     repo_tpl = repo_cfg.get("template_file")
     if repo_tpl:
-        text, src = load_template(repo_tpl)
-        if src != "built-in":
+        text = load_template(repo_tpl)
+        if text is not None:
             return text, f"repo-specific ({repo_tpl})"
-        # file declared but missing — fall through to global
+        # declared but file missing — fall through
 
     global_tpl = global_cfg.get("template_file")
     if global_tpl:
-        text, src = load_template(global_tpl)
-        if src != "built-in":
+        text = load_template(global_tpl)
+        if text is not None:
             return text, f"global ({global_tpl})"
-        # global declared but missing — fall through to built-in
+        # declared but file missing — fall through
 
-    return BUILTIN_TEMPLATE, "built-in"
+    return None, "none (auto-content only)"
 
 
 # ── Work Item resolution ──────────────────────────────────────────────────────
 
 
 def collect_work_items(
-    files: list[dict],
-    group_cfg: dict | None,
+    files: List[dict],
+    group_cfg: Optional[dict],
     repo_cfg: dict,
-) -> list[int]:
+) -> List[int]:
     """
     Collect all unique work item IDs for a group's PR.
 
-    Precedence (all are merged and deduplicated):
+    All three levels are merged and deduplicated:
       - repo-level  : repo_cfg["work_items"]
-      - group-level : group_cfg["work_items"]  (the matching branch_group entry)
+      - group-level : group_cfg["work_items"]
       - file-level  : each file entry's "work_items"
     """
-    ids: set[int] = set()
+    ids = set()
 
     for wid in repo_cfg.get("work_items", []):
         ids.add(int(wid))
@@ -268,7 +243,9 @@ examples:
     return parser.parse_args()
 
 
-def filter_repos(repos: list[dict], selected: list[str] | None) -> list[dict]:
+def filter_repos(
+    repos: List[dict], selected: Optional[List[str]]
+) -> List[dict]:
     if not selected:
         return repos
     filtered = [r for r in repos if r["name"] in selected]
@@ -279,8 +256,8 @@ def filter_repos(repos: list[dict], selected: list[str] | None) -> list[dict]:
 
 
 def filter_branches(
-    branches: list[str], selected: list[str] | None
-) -> list[str]:
+    branches: List[str], selected: Optional[List[str]]
+) -> List[str]:
     if not selected:
         return branches
     filtered = [b for b in branches if b in selected]
@@ -291,8 +268,8 @@ def filter_branches(
 
 
 def filter_groups(
-    grouped_files: dict[str, list[dict]], selected: list[str] | None
-) -> dict[str, list[dict]]:
+    grouped_files: Dict[str, List[dict]], selected: Optional[List[str]]
+) -> Dict[str, List[dict]]:
     if not selected:
         return grouped_files
     filtered = {g: f for g, f in grouped_files.items() if g in selected}
@@ -306,7 +283,7 @@ def filter_groups(
 
 
 def resolve_group(
-    dst: str, branch_groups: list[dict], catch_all: str
+    dst: str, branch_groups: List[dict], catch_all: str
 ) -> str:
     for group_cfg in branch_groups:
         if re.search(group_cfg["pattern"], dst):
@@ -314,7 +291,9 @@ def resolve_group(
     return catch_all
 
 
-def get_group_cfg(group: str, branch_groups: list[dict]) -> dict | None:
+def get_group_cfg(
+    group: str, branch_groups: List[dict]
+) -> Optional[dict]:
     """Return the branch_group config entry for a resolved group name."""
     for g in branch_groups:
         if g["group"] == group:
@@ -323,10 +302,10 @@ def get_group_cfg(group: str, branch_groups: list[dict]) -> dict | None:
 
 
 def group_files(
-    files: list[dict],
-    branch_groups: list[dict],
+    files: List[dict],
+    branch_groups: List[dict],
     catch_all: str,
-) -> dict[str, list[dict]]:
+) -> Dict[str, List[dict]]:
     grouped = defaultdict(list)
     for entry in files:
         group = resolve_group(entry["dst"], branch_groups, catch_all)
@@ -338,28 +317,27 @@ def group_files(
 
 
 def build_pr_description(
-    template: str,
+    template: Optional[str],
     group: str,
-    domain_map: dict[str, str],
-    files: list[dict],
+    domain_map: Dict[str, str],
+    files: List[dict],
     repo_name: str,
     base_branch: str,
     timestamp: str,
 ) -> str:
+    """
+    Build the PR description.
+
+    If a template is provided:
+      - Auto-check the matching domain checkbox.
+      - Inject auto-content at the known placeholder, or append if not found.
+
+    If no template: return auto-content only.
+    """
     mapped_domain = domain_map.get(group)
 
-    description = template
-
-    # Auto-check the matching domain checkbox (only relevant if template
-    # contains domain checkboxes — no-op on built-in template)
-    if mapped_domain and mapped_domain in DOMAIN_OPTIONS:
-        description = description.replace(
-            f"- [ ] {mapped_domain}?",
-            f"- [x] {mapped_domain}?",
-        )
-
     file_lines = "\n".join(f"  - `{f['dst']}`" for f in files)
-    auto_description = (
+    auto_content = (
         f"Automated PR raised by pr-automation script.\n\n"
         f"**Repo:** `{repo_name}`  \n"
         f"**Group:** `{group}`  \n"
@@ -369,18 +347,27 @@ def build_pr_description(
         f"{file_lines}"
     )
 
-    # Replace the standard placeholder (official template)
+    if template is None:
+        return auto_content
+
+    description = template
+
+    # Auto-check the matching domain checkbox
+    if mapped_domain and mapped_domain in DOMAIN_OPTIONS:
+        description = description.replace(
+            f"- [ ] {mapped_domain}?",
+            f"- [x] {mapped_domain}?",
+        )
+
+    # Inject auto-content at the known placeholder
     if TEMPLATE_DESCRIPTION_PLACEHOLDER in description:
         description = description.replace(
             TEMPLATE_DESCRIPTION_PLACEHOLDER,
-            auto_description,
+            auto_content,
         )
-    elif "{description}" in description:
-        # Built-in template uses {description}
-        description = description.replace("{description}", auto_description)
     else:
         # Unknown template structure — append at the bottom
-        description = description.rstrip() + "\n\n---\n\n" + auto_description
+        description = description.rstrip() + "\n\n---\n\n" + auto_content
 
     return description
 
@@ -396,7 +383,7 @@ def get_env() -> dict:
     return env
 
 
-def run(cmd: list[str], cwd: str = None) -> str:
+def run(cmd: List[str], cwd: Optional[str] = None) -> str:
     result = subprocess.run(
         cmd,
         cwd=cwd,
@@ -456,7 +443,7 @@ def checkout_existing_branch(
     step.ok(f"Checked out and up to date on '{branch}'")
 
 
-def copy_files(files: list[dict], repo_local_path: str) -> list[str]:
+def copy_files(files: List[dict], repo_local_path: str) -> List[str]:
     copied = []
     for entry in files:
         src = os.path.abspath(entry["src"])
@@ -492,9 +479,9 @@ def commit_and_push(repo_local_path: str, branch: str, message: str):
     step.ok(f"Push successful → origin/{branch}")
 
 
-# ── Azure DevOps client (lazy) ────────────────────────────────────────────────
+# ── Azure DevOps clients (lazy) ───────────────────────────────────────────────
 
-_clients: dict = {}
+_clients: Dict[str, object] = {}
 
 
 def get_git_client(org_url: str):
@@ -534,23 +521,25 @@ def link_work_items_to_pr(
     project: str,
     repo_name: str,
     pr_id: int,
-    work_item_ids: list[int],
+    work_item_ids: List[int],
     org_url: str,
 ):
     """
-    Link ADO work items to an existing PR using the WIT patch API.
+    Link ADO work items to a PR using the WIT patch API.
 
-    Each work item gets a "Pull Request" relation added pointing to the PR URL.
-    Skips any IDs that fail (e.g. ticket doesn't exist), with a warning.
+    Fetches the PR's server-generated artifact_id so the URL is always
+    correct. Skips any IDs that fail (e.g. ticket doesn't exist).
     """
     if not work_item_ids:
         return
 
     repo = git_client.get_repository(repo_name, project=project)
-    pr_artifact_id = (
-        f"vstfs:///Git/PullRequestId/"
-        f"{project}%2F{repo.id}%2F{pr_id}"
+
+    # Use the server-generated artifact_id — never construct it manually
+    pr = git_client.get_pull_request(
+        repository_id=repo.id, pull_request_id=pr_id, project=project
     )
+    pr_artifact_id = pr.artifact_id
 
     for wid in work_item_ids:
         try:
@@ -561,17 +550,12 @@ def link_work_items_to_pr(
                     value={
                         "rel": "ArtifactLink",
                         "url": pr_artifact_id,
-                        "attributes": {
-                            "name": "Pull Request",
-                        },
+                        "attributes": {"name": "Pull Request"},
                     },
                 )
             ]
-            wit_client.update_work_item(
-                document=patch,
-                id=wid,
-                project=project,
-            )
+            # Note: omit project= for cross-project work item support
+            wit_client.update_work_item(document=patch, id=wid)
             step.ok(f"Linked work item #{wid} → PR #{pr_id}")
         except Exception as e:
             step.warn(f"Could not link work item #{wid}: {e}")
@@ -585,13 +569,15 @@ def raise_pr(
     target_branch: str,
     title: str,
     org_url: str,
-    reviewers: list[str],
+    reviewers: List[str],
     description: str,
 ) -> int:
     repo = git_client.get_repository(repo_name, project=project)
 
     reviewer_refs = (
-        [IdentityRefWithVote(id=guid) for guid in reviewers] if reviewers else []
+        [IdentityRefWithVote(id=guid) for guid in reviewers]
+        if reviewers
+        else []
     )
 
     pr_payload = GitPullRequestToCreate(
@@ -602,7 +588,9 @@ def raise_pr(
         reviewers=reviewer_refs,
     )
 
-    created = git_client.create_pull_request(pr_payload, repo.id, project=project)
+    created = git_client.create_pull_request(
+        pr_payload, repo.id, project=project
+    )
     pr_url = (
         f"{org_url}/{project}/_git/{repo_name}"
         f"/pullrequest/{created.pull_request_id}"
@@ -620,13 +608,13 @@ def raise_pr(
 
 def print_dry_run_plan(
     repo_name: str,
-    grouped_files: dict[str, list[dict]],
-    target_branches: list[str],
+    grouped_files: Dict[str, List[dict]],
+    target_branches: List[str],
     state: dict,
-    reviewers: list[str],
-    domain_map: dict[str, str],
+    reviewers: List[str],
+    domain_map: Dict[str, str],
     template_source: str,
-    branch_groups: list[dict],
+    branch_groups: List[dict],
     repo_cfg: dict,
 ):
     print(f"\n  Template source : {template_source}")
@@ -636,7 +624,9 @@ def print_dry_run_plan(
         i = 0
         for group, files in grouped_files.items():
             state_entry = (
-                state.get(repo_name, {}).get(group, {}).get(base_branch, {})
+                state.get(repo_name, {})
+                .get(group, {})
+                .get(base_branch, {})
             )
             existing_pr = state_entry.get("pr_id")
             existing_br = state_entry.get("branch")
@@ -669,14 +659,13 @@ def print_dry_run_plan(
                 print(f"           {f['src']}{wi_str}")
                 print(f"           └─► {f['dst']}")
 
+            i += 1
             if work_items:
-                i += 1
                 print(
-                    f"      {i}. Work items to link ({len(work_items)}): "
-                    f"{work_items}"
+                    f"      {i}. Work items to link"
+                    f" ({len(work_items)}): {work_items}"
                 )
             else:
-                i += 1
                 print(f"      {i}. Work items : none")
 
             if reviewers:
@@ -694,17 +683,17 @@ def print_dry_run_plan(
 def process_group(
     repo_name: str,
     group: str,
-    files: list[dict],
+    files: List[dict],
     base_branch: str,
     timestamp: str,
     local_path: str,
     state: dict,
     git_client,
     global_cfg: dict,
-    reviewers: list[str],
-    domain_map: dict[str, str],
-    template: str,
-    branch_groups: list[dict],
+    reviewers: List[str],
+    domain_map: Dict[str, str],
+    template: Optional[str],
+    branch_groups: List[dict],
     repo_cfg: dict,
 ):
     org_url = global_cfg["azure"]["org_url"]
@@ -774,7 +763,7 @@ def process_group(
 
     # ── Step 5: raise PR or log amendment + link work items ──────────────────
     if not is_amendment:
-        step.log("Building PR description from template...")
+        step.log("Building PR description...")
         description = build_pr_description(
             template,
             group,
@@ -788,7 +777,9 @@ def process_group(
         step.log(f"Domain checkbox auto-checked : [{mapped_domain}]")
 
         step.log("Raising PR in Azure DevOps...")
-        pr_title = f"[AUTO] {repo_name}/{group} → {base_branch} | {timestamp}"
+        pr_title = (
+            f"[AUTO] {repo_name}/{group} → {base_branch} | {timestamp}"
+        )
         pr_id = raise_pr(
             git_client,
             project,
@@ -805,7 +796,6 @@ def process_group(
             "pr_id": pr_id,
         }
 
-        # Link work items to the newly created PR
         if work_items:
             step.log(
                 f"Linking {len(work_items)} work item(s)"
@@ -827,7 +817,6 @@ def process_group(
         step.ok(
             f"Amendment pushed — PR #{existing_pr_id} updated automatically"
         )
-        # Also link any work items to the existing PR in case new ones were added
         if work_items:
             step.log(
                 f"Linking {len(work_items)} work item(s)"
@@ -842,6 +831,8 @@ def process_group(
                 work_items,
                 org_url,
             )
+        else:
+            step.log("No work items configured for this group — skipping link")
 
     run(["git", "checkout", base_branch], cwd=local_path)
 
