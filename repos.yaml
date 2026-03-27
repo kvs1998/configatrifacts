@@ -13,6 +13,10 @@ repos:
     target_branches:
       - develop
       - main
+    # GUIDs — hover over reviewer avatar in Azure DevOps PR page to get ID
+    reviewers:
+      - "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      - "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
     # patterns are evaluated top-down, first match wins
     # put more specific patterns first
     branch_groups:
