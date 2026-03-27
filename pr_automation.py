@@ -10,9 +10,8 @@ import yaml
 from azure.devops.connection import Connection
 from azure.devops.v7_1.git.models import (
     GitPullRequestToCreate,
-    GitPullRequestSearchCriteria,
+    IdentityRefWithVote,
 )
-from azure.devops.v7_1.git.models import IdentityRefWithVote
 from dotenv import load_dotenv
 from msrest.authentication import BasicAuthentication
 
@@ -21,13 +20,17 @@ load_dotenv()
 PAT        = os.environ["AZURE_PAT"]
 REPOS_ROOT = os.path.abspath(os.environ.get("REPOS_ROOT", "/tmp/cloned_repos"))
 STATE_FILE = ".pr_state.yaml"
+TEMPLATE_FILE = "pull_request_template.md"
+
+# Domain checkboxes present in the template under "Select a Domain"
+DOMAIN_OPTIONS = [
+    "ABOR", "ACT", "ALT", "ANR", "EDP", "ESG", "IBOR", "MKT", "REF"
+]
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 class Step:
-    """Simple enumerated step logger scoped per repo+branch+group context."""
-
     def __init__(self):
         self._count = 0
 
@@ -55,14 +58,12 @@ step = Step()
 
 
 def section(title: str):
-    """Top level section header."""
     print(f"\n{'═' * 60}")
     print(f"  {title}")
     print(f"{'═' * 60}")
 
 
 def subsection(title: str):
-    """Branch level header."""
     print(f"\n  {'─' * 55}")
     print(f"  {title}")
     print(f"  {'─' * 55}")
@@ -93,6 +94,16 @@ def load_state() -> dict:
 def save_state(state: dict):
     with open(STATE_FILE, "w") as f:
         yaml.dump(state, f, default_flow_style=False)
+
+
+def load_template() -> str:
+    if not os.path.exists(TEMPLATE_FILE):
+        raise FileNotFoundError(
+            f"PR template not found at '{TEMPLATE_FILE}'. "
+            f"Please place pull_request_template.md in the project root."
+        )
+    with open(TEMPLATE_FILE) as f:
+        return f.read()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -151,7 +162,9 @@ examples:
     return parser.parse_args()
 
 
-def filter_repos(repos: list[dict], selected: list[str] | None) -> list[dict]:
+def filter_repos(
+    repos: list[dict], selected: list[str] | None
+) -> list[dict]:
     if not selected:
         return repos
     filtered = [r for r in repos if r["name"] in selected]
@@ -169,7 +182,7 @@ def filter_branches(
     filtered = [b for b in branches if b in selected]
     missing  = set(selected) - set(filtered)
     if missing:
-        print(f"  ⚠  Branches not found in repo config: {', '.join(missing)}")
+        print(f"  ⚠  Branches not in repo config: {', '.join(missing)}")
     return filtered
 
 
@@ -187,7 +200,9 @@ def filter_groups(
 
 # ── Group resolution ──────────────────────────────────────────────────────────
 
-def resolve_group(dst: str, branch_groups: list[dict], catch_all: str) -> str:
+def resolve_group(
+    dst: str, branch_groups: list[dict], catch_all: str
+) -> str:
     for group_cfg in branch_groups:
         if re.search(group_cfg["pattern"], dst):
             return group_cfg["group"]
@@ -204,6 +219,55 @@ def group_files(
         group = resolve_group(entry["dst"], branch_groups, catch_all)
         grouped[group].append(entry)
     return dict(grouped)
+
+
+# ── PR Description ────────────────────────────────────────────────────────────
+
+def build_pr_description(
+    template: str,
+    group: str,
+    domain_map: dict[str, str],
+    files: list[dict],
+    repo_name: str,
+    base_branch: str,
+    timestamp: str,
+) -> str:
+    """
+    Takes the official template and:
+    1. Auto-checks the domain checkbox matching this group.
+    2. Replaces the Description placeholder with auto-generated content.
+    """
+    mapped_domain = domain_map.get(group)
+
+    # Auto-check the matching domain checkbox
+    # e.g. replaces "- [ ] REF?" with "- [x] REF?"
+    description = template
+    if mapped_domain and mapped_domain in DOMAIN_OPTIONS:
+        description = description.replace(
+            f"- [ ] {mapped_domain}?",
+            f"- [x] {mapped_domain}?",
+        )
+
+    # Build auto description content to inject at the bottom
+    file_lines = "\n".join(f"  - `{f['dst']}`" for f in files)
+    auto_description = (
+        f"Automated PR raised by pr-automation script.\n\n"
+        f"**Repo:** `{repo_name}`  \n"
+        f"**Group:** `{group}`  \n"
+        f"**Target branch:** `{base_branch}`  \n"
+        f"**Timestamp:** `{timestamp}`  \n\n"
+        f"**Files changed:**  \n"
+        f"{file_lines}"
+    )
+
+    # Replace the description placeholder line at the bottom of the template
+    description = description.replace(
+        "Add a description of what is being changed, and why, "
+        "and a Release Packet, if going to production.",
+        auto_description,
+    )
+
+    return description
 
 
 # ── Git helpers (SSH) ─────────────────────────────────────────────────────────
@@ -239,16 +303,18 @@ def clone_or_fetch(repo_name: str, ssh_remote_base: str) -> str:
     if not os.path.exists(local_path):
         step.log(f"Cloning '{repo_name}' via SSH into {local_path}")
         run(["git", "clone", ssh_url, local_path])
-        step.ok(f"Clone successful")
+        step.ok("Clone successful")
     else:
         step.log(f"Repo '{repo_name}' exists locally, fetching all remotes...")
         run(["git", "fetch", "--all"], cwd=local_path)
-        step.ok(f"Fetch successful")
+        step.ok("Fetch successful")
 
     return local_path
 
 
-def prepare_branch(local_path: str, base_branch: str, new_branch: str):
+def prepare_branch(
+    local_path: str, base_branch: str, new_branch: str
+):
     step.log(f"Checking out '{base_branch}'")
     run(["git", "checkout", base_branch], cwd=local_path)
 
@@ -264,7 +330,7 @@ def prepare_branch(local_path: str, base_branch: str, new_branch: str):
 def checkout_existing_branch(
     local_path: str, branch: str, base_branch: str
 ):
-    step.log(f"Switching to base '{base_branch}' before fetching feature branch")
+    step.log(f"Switching to '{base_branch}' before fetching feature branch")
     run(["git", "checkout", base_branch], cwd=local_path)
 
     step.log(f"Fetching existing branch '{branch}' from origin")
@@ -288,7 +354,7 @@ def copy_files(files: list[dict], repo_local_path: str) -> list[str]:
 
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
-        step.log(f"Copied: {entry['src']}")
+        step.log(f"Copied : {entry['src']}")
         step.log(f"    └─► {entry['dst']}")
         copied.append(entry["dst"])
 
@@ -300,7 +366,9 @@ def has_changes(repo_local_path: str) -> bool:
     return bool(status.strip())
 
 
-def commit_and_push(repo_local_path: str, branch: str, message: str):
+def commit_and_push(
+    repo_local_path: str, branch: str, message: str
+):
     step.log("Staging all changes (git add .)")
     run(["git", "add", "."], cwd=repo_local_path)
 
@@ -312,7 +380,7 @@ def commit_and_push(repo_local_path: str, branch: str, message: str):
     step.ok(f"Push successful → origin/{branch}")
 
 
-# ── PR helpers ────────────────────────────────────────────────────────────────
+# ── Azure DevOps client (lazy) ────────────────────────────────────────────────
 
 _git_client = None
 
@@ -320,9 +388,11 @@ _git_client = None
 def get_git_client(org_url: str):
     global _git_client
     if _git_client is None:
+        step.log("Initializing Azure DevOps connection...")
         credentials = BasicAuthentication("", PAT)
         connection  = Connection(base_url=org_url, creds=credentials)
         _git_client = connection.clients.get_git_client()
+        step.ok("Azure DevOps client ready")
     return _git_client
 
 
@@ -343,16 +413,18 @@ def raise_pr(
     title: str,
     org_url: str,
     reviewers: list[str],
+    description: str,
 ) -> int:
     repo = git_client.get_repository(repo_name, project=project)
 
-    reviewer_refs = [
-        IdentityRefWithVote(id=guid) for guid in reviewers
-    ] if reviewers else []
+    reviewer_refs = (
+        [IdentityRefWithVote(id=guid) for guid in reviewers]
+        if reviewers else []
+    )
 
     pr_payload = GitPullRequestToCreate(
         title=title,
-        description="Automated PR — please review and merge manually.",
+        description=description,
         source_ref_name=f"refs/heads/{source_branch}",
         target_ref_name=f"refs/heads/{target_branch}",
         reviewers=reviewer_refs,
@@ -368,7 +440,7 @@ def raise_pr(
     step.ok(f"PR #{created.pull_request_id} raised successfully")
     step.log(f"URL → {pr_url}")
     if reviewers:
-        step.log(f"Reviewers assigned: {len(reviewers)}")
+        step.log(f"Reviewers assigned : {len(reviewers)}")
 
     return created.pull_request_id
 
@@ -381,40 +453,40 @@ def print_dry_run_plan(
     target_branches: list[str],
     state: dict,
     reviewers: list[str],
+    domain_map: dict[str, str],
 ):
     for base_branch in target_branches:
         subsection(f"DRY RUN | {repo_name} → {base_branch}")
         i = 0
         for group, files in grouped_files.items():
-            state_entry    = (
-                state.get(repo_name, {}).get(group, {}).get(base_branch, {})
+            state_entry = (
+                state.get(repo_name, {})
+                     .get(group, {})
+                     .get(base_branch, {})
             )
             existing_pr = state_entry.get("pr_id")
             existing_br = state_entry.get("branch")
+            mapped_domain = domain_map.get(group, "none")
 
             group_header(group)
 
             i += 1
             if existing_pr:
-                print(
-                    f"      {i}. ACTION  : AMEND existing PR"
-                )
-                print(
-                    f"      {i}. Branch  : {existing_br}"
-                )
-                print(
-                    f"      {i}. PR      : #{existing_pr}"
-                )
+                print(f"      {i}. ACTION    : AMEND existing PR")
+                print(f"      {i}. Branch    : {existing_br}")
+                print(f"      {i}. PR        : #{existing_pr}")
             else:
+                print(f"      {i}. ACTION    : NEW branch + PR")
                 print(
-                    f"      {i}. ACTION  : NEW branch + PR"
-                )
-                print(
-                    f"      {i}. Branch  : auto/{group}-{base_branch}-<timestamp>"
+                    f"      {i}. Branch    : "
+                    f"auto/{group}-{base_branch}-<timestamp>"
                 )
 
             i += 1
-            print(f"      {i}. Files   :")
+            print(f"      {i}. Domain    : {mapped_domain} (will be checked)")
+
+            i += 1
+            print(f"      {i}. Files     :")
             for f in files:
                 print(f"           {f['src']}")
                 print(f"           └─► {f['dst']}")
@@ -441,11 +513,13 @@ def process_group(
     git_client,
     global_cfg: dict,
     reviewers: list[str],
+    domain_map: dict[str, str],
+    template: str,
 ):
     org_url = global_cfg["azure"]["org_url"]
     project = global_cfg["azure"]["project"]
 
-    state_entry     = (
+    state_entry = (
         state
         .setdefault(repo_name, {})
         .setdefault(group, {})
@@ -507,14 +581,23 @@ def process_group(
 
     # ── Step 5: raise PR or log amendment ────────────────────────────────────
     if not is_amendment:
+        step.log("Building PR description from official template...")
+        description = build_pr_description(
+            template, group, domain_map,
+            files, repo_name, base_branch, timestamp,
+        )
+        mapped_domain = domain_map.get(group, "none")
+        step.log(f"Domain checkbox auto-checked : [{mapped_domain}]")
+
         step.log("Raising PR in Azure DevOps...")
         pr_title = (
             f"[AUTO] {repo_name}/{group} → {base_branch} | {timestamp}"
         )
         pr_id = raise_pr(
             git_client, project, repo_name,
-            new_branch, base_branch, pr_title, org_url,
-            reviewers,
+            new_branch, base_branch,
+            pr_title, org_url,
+            reviewers, description,
         )
         state[repo_name][group][base_branch] = {
             "branch": new_branch,
@@ -525,7 +608,6 @@ def process_group(
             f"Amendment pushed — PR #{existing_pr_id} updated automatically"
         )
 
-    # return to base so next group starts clean
     run(["git", "checkout", base_branch], cwd=local_path)
 
 
@@ -537,6 +619,7 @@ def process_repo(
     global_cfg: dict,
     state: dict,
     args: argparse.Namespace,
+    template: str,
 ):
     repo_name       = repo_cfg["name"]
     files           = repo_cfg.get("files", [])
@@ -544,6 +627,7 @@ def process_repo(
     catch_all       = global_cfg["defaults"]["catch_all_branch_prefix"]
     ssh_remote_base = global_cfg["git"]["ssh_remote_base"]
     reviewers       = repo_cfg.get("reviewers", [])
+    domain_map      = repo_cfg.get("domain_map", {})
 
     target_branches = filter_branches(
         repo_cfg.get("target_branches", ["develop"]), args.branches
@@ -576,13 +660,14 @@ def process_repo(
 
     if args.dry_run:
         print_dry_run_plan(
-            repo_name, grouped_files, target_branches, state, reviewers
+            repo_name, grouped_files,
+            target_branches, state,
+            reviewers, domain_map,
         )
         return
 
     git_client = get_git_client(global_cfg["azure"]["org_url"])
 
-    # clone/fetch once per repo
     print("\n  Initializing local repo...")
     step.reset()
     local_path = clone_or_fetch(repo_name, ssh_remote_base)
@@ -596,7 +681,7 @@ def process_repo(
                 repo_name, group, group_file_list,
                 base_branch, timestamp, local_path,
                 state, git_client, global_cfg,
-                reviewers,
+                reviewers, domain_map, template,
             )
             group_footer(group)
 
@@ -608,6 +693,7 @@ def main():
     config    = load_config()
     state     = load_state()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    template  = load_template()
 
     print("\n" + "═" * 60)
     print("  PR Automation — Azure DevOps")
@@ -623,7 +709,10 @@ def main():
 
     for repo_cfg in repos:
         try:
-            process_repo(repo_cfg, timestamp, config, state, args)
+            process_repo(
+                repo_cfg, timestamp, config,
+                state, args, template,
+            )
         except subprocess.CalledProcessError as e:
             print(f"\n  ❌ Git error for {repo_cfg['name']}: {e.stderr}")
         except Exception as e:
