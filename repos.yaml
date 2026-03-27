@@ -6,22 +6,33 @@ git:
   ssh_remote_base: "git@ssh.dev.azure.com:v3/yourorg/yourproject"
 
 defaults:
-  catch_all_branch_prefix: "misc"   # unmatched files go to auto/misc-develop-TIMESTAMP
+  catch_all_branch_prefix: "misc"
+
+# Optional: global fallback template
+template_file: "pull_request_template.md"
 
 repos:
   - name: configartifacts
     target_branches:
       - develop
       - main
-    # GUIDs — hover over reviewer avatar in Azure DevOps PR page to get ID
     reviewers:
       - "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
       - "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
-    # patterns are evaluated top-down, first match wins
-    # put more specific patterns first
+
+    # Optional: repo-specific template (overrides global)
+    template_file: "templates/configartifacts_pr_template.md"
+
+    # Optional: repo-level work items (applied to ALL PRs in this repo)
+    work_items:
+      - 12345
+
     branch_groups:
       - group: IBOR
-        pattern: "^IBOR/"          # anything starting with IBOR/
+        pattern: "^IBOR/"
+        # Optional: group-level work items (applied to all files in this group)
+        work_items:
+          - 67890
 
       - group: REF
         pattern: "^REF/"
@@ -29,45 +40,30 @@ repos:
       - group: ACT
         pattern: "^ACT/"
 
-      - group: ALT
-        pattern: "^ALT/"
-
-      - group: ANR
-        pattern: "^ANR/"
-
-      - group: EDP
-        pattern: "^EDP/"
-
-      - group: ESG
-        pattern: "^ESG/"
-
-      - group: MKT
-        pattern: "^MKT/"
-
-      - group: ABOR
-        pattern: "^ABOR/"
-
-      # more specific example — same dir but different group based on depth
-      - group: IBOR-special
-        pattern: "^SOME_DIR/.*/IBOR$"   # IBOR appearing at end of path
-
     files:
       - src: staging/configartifacts/IBOR/datasets/file1.yaml
         dst: IBOR/datasets/file1.yaml
+        work_items:
+          - 11111   # file-level ticket
 
       - src: staging/configartifacts/IBOR/mappings/file2.yaml
         dst: IBOR/mappings/file2.yaml
+        work_items:
+          - 11111   # same ticket as above — will be deduped
+          - 22222
 
       - src: staging/configartifacts/REF/datasets/file3.yaml
         dst: REF/datasets/file3.yaml
+        # no ticket here — repo-level 12345 still applies
 
       - src: staging/configartifacts/unmapped_file.yaml
-        dst: unmapped_file.yaml        # no pattern matches → goes to misc branch
+        dst: unmapped_file.yaml
 
   - name: aladb
     target_branches:
       - develop
       - main
+    # No template_file here — falls back to global, then built-in
     branch_groups:
       - group: CORE
         pattern: "^core/"
@@ -78,3 +74,5 @@ repos:
     files:
       - src: staging/aladb/core/somefile.sql
         dst: core/somefile.sql
+        work_items:
+          - 99999
