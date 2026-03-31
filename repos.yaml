@@ -1,76 +1,59 @@
 azure:
   org_url: https://dev.azure.com/yourorg
-  project: yourproject
-
-git:
-  ssh_remote_base: "git@ssh.dev.azure.com:v3/yourorg/yourproject"
 
 defaults:
   catch_all_branch_prefix: "misc"
 
-# Optional: global fallback template
 template_file: "pull_request_template.md"
 
 repos:
   - name: configartifacts
+    project: yourproject
+    ssh_remote_base: "git@ssh.dev.azure.com:v3/yourorg/yourproject"
     target_branches:
       - develop
       - main
     reviewers:
       - "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
       - "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
-
-    # Optional: repo-specific template (overrides global)
     template_file: "templates/configartifacts_pr_template.md"
-
-    # Optional: repo-level work items (applied to ALL PRs in this repo)
     work_items:
       - 12345
-
     branch_groups:
       - group: IBOR
         pattern: "^IBOR/"
-        # Optional: group-level work items (applied to all files in this group)
         work_items:
           - 67890
-
       - group: REF
         pattern: "^REF/"
-
       - group: ACT
         pattern: "^ACT/"
-
     files:
       - src: staging/configartifacts/IBOR/datasets/file1.yaml
         dst: IBOR/datasets/file1.yaml
         work_items:
-          - 11111   # file-level ticket
-
+          - 11111
       - src: staging/configartifacts/IBOR/mappings/file2.yaml
         dst: IBOR/mappings/file2.yaml
         work_items:
-          - 11111   # same ticket as above — will be deduped
+          - 11111
           - 22222
-
       - src: staging/configartifacts/REF/datasets/file3.yaml
         dst: REF/datasets/file3.yaml
-        # no ticket here — repo-level 12345 still applies
-
       - src: staging/configartifacts/unmapped_file.yaml
         dst: unmapped_file.yaml
 
   - name: aladb
+    project: anotherproject
+    ssh_remote_base: "git@ssh.dev.azure.com:v3/yourorg/anotherproject"
     target_branches:
       - develop
       - main
-    # No template_file here — falls back to global, then built-in
     branch_groups:
       - group: CORE
         pattern: "^core/"
-
       - group: SCHEMA
         pattern: "^schema/"
-
     files:
       - src: staging/aladb/core/somefile.sql
         dst: core/somefile.sql
