@@ -25,7 +25,15 @@ REPOS_ROOT = os.path.abspath(os.environ.get("REPOS_ROOT", "/tmp/cloned_repos"))
 STATE_FILE = ".pr_state.yaml"
 
 DOMAIN_OPTIONS = [
-    "ABOR", "ACT", "ALT", "ANR", "EDP", "ESG", "IBOR", "MKT", "REF",
+    "ABOR",
+    "ACT",
+    "ALT",
+    "ANR",
+    "EDP",
+    "ESG",
+    "IBOR",
+    "MKT",
+    "REF",
 ]
 
 TEMPLATE_DESCRIPTION_PLACEHOLDER = (
@@ -82,6 +90,38 @@ def group_header(group: str):
 
 def group_footer(group: str):
     print(f"    └─ Done  : {group}")
+
+
+# ── Config validation ─────────────────────────────────────────────────────────
+
+
+REQUIRED_REPO_FIELDS = ["project", "ssh_remote_base"]
+
+
+def validate_config(config: dict) -> bool:
+    """
+    Validate that every repo has all required per-repo fields.
+    Prints all errors found before returning — does not stop at the first one.
+    Returns True if valid, False if any field is missing.
+    """
+    errors: List[str] = []
+
+    for repo in config.get("repos", []):
+        name = repo.get("name", "<unnamed>")
+        for field in REQUIRED_REPO_FIELDS:
+            if not repo.get(field):
+                errors.append(
+                    f"  ❌ Repo '{name}' is missing required field: '{field}'"
+                )
+
+    if errors:
+        print("\n  Configuration errors — fix before running:\n")
+        for e in errors:
+            print(e)
+        print()
+        return False
+
+    return True
 
 
 # ── Config + State ────────────────────────────────────────────────────────────
@@ -150,6 +190,47 @@ def collect_work_items(
     return sorted(ids)
 
 
+# ── ADO connection + identity ─────────────────────────────────────────────────
+
+
+def make_connection(org_url: str) -> Connection:
+    credentials = BasicAuthentication("", PAT)
+    return Connection(base_url=org_url, creds=credentials)
+
+
+def get_current_user_id(connection: Connection) -> str:
+    """
+    Resolve the identity of the PAT owner.
+
+    Uses the Profile API ('me' alias) which works for both user PATs
+    and service-principal PATs that have profile access.
+    Falls back to the Location/Connection Data descriptor if the
+    profile endpoint returns nothing (e.g. scoped PATs).
+    """
+    try:
+        profile_client = connection.clients.get_profile_client()
+        profile = profile_client.get_profile("me")
+        if profile and profile.id:
+            return profile.id
+    except Exception:
+        pass
+
+    # Fallback: read the authorized identity from connection data
+    try:
+        location_client = connection.clients.get_location_client()
+        conn_data = location_client.get_connection_data()
+        uid = conn_data.authenticated_user.id
+        if uid:
+            return uid
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not resolve current user identity from PAT. "
+        "Ensure the PAT has at least 'User Profile (read)' scope."
+    )
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
@@ -192,7 +273,10 @@ examples:
         dest="branches",
         action="append",
         metavar="BRANCH_NAME",
-        help="Target branch(es) to process. Repeatable. Omit for all branches.",
+        help=(
+            "Target branch(es) to process. "
+            "Repeatable. Omit for all branches."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -203,10 +287,9 @@ examples:
         "--sync-state",
         action="store_true",
         help=(
-            "Query ADO for active PRs and populate the state file.\n"
-            "Matches PRs whose source branch contains 'auto/<group>-<target>'.\n"
-            "Also catches manually raised PRs if their source branch\n"
-            "follows the auto/ naming convention.\n"
+            "Query ADO for PRs created by YOU and populate the state file.\n"
+            "Only PRs whose source branch follows the auto/<group>-<target>\n"
+            "naming convention are recorded — all others are skipped.\n"
             "Saves state and exits — does not raise any PRs."
         ),
     )
@@ -255,11 +338,6 @@ def filter_groups(
 def resolve_group(
     dst: str, branch_groups: List[dict], catch_all: str
 ) -> str:
-    """
-    Match dst (repo-relative destination path) against configured patterns.
-    dst is used — not src — because patterns are written against the repo's
-    own directory structure, which dst reflects.
-    """
     for group_cfg in branch_groups:
         if re.search(group_cfg["pattern"], dst):
             return group_cfg["group"]
@@ -282,7 +360,6 @@ def group_files(
 ) -> Dict[str, List[dict]]:
     grouped = defaultdict(list)
     for entry in files:
-        # Pattern matching is done on dst (repo path), not src (staging path)
         group = resolve_group(entry["dst"], branch_groups, catch_all)
         grouped[group].append(entry)
     return dict(grouped)
@@ -299,23 +376,22 @@ def _parse_auto_branch(
     """
     Try to extract (group, target_branch) from a source branch name.
 
-    Handles two formats:
-      auto/<group>-<target>-<timestamp>   ← created by this script
-      auto/<group>-<target>               ← manually created, no timestamp
+    Only matches the auto/ convention created by this script:
+      auto/<group>-<target>-<timestamp>
+      auto/<group>-<target>               ← no timestamp variant
 
-    Returns (None, None) if the branch doesn't match any known
-    group + target combination.
+    Any other branch naming (manually raised PRs with custom names)
+    intentionally returns (None, None) — there is no reliable way to
+    map an arbitrary branch name to a group without ambiguity.
     """
-    # Strip refs/heads/ prefix if present
     branch = source_branch.replace("refs/heads/", "")
 
     if not branch.startswith("auto/"):
         return None, None
 
-    suffix = branch[len("auto/"):]  # e.g. "IBOR-develop-20240101-120000"
+    suffix = branch[len("auto/"):]
 
-    # Try every known (group, target) pair — longest group name first to
-    # avoid prefix collisions (e.g. "IBOR-special" vs "IBOR")
+    # Longest group name first to avoid prefix collisions
     sorted_groups = sorted(known_groups, key=len, reverse=True)
 
     for group in sorted_groups:
@@ -333,37 +409,41 @@ def sync_state_from_ado(
     state: dict,
     selected_repos: Optional[List[str]],
     selected_branches: Optional[List[str]],
-):
+) -> int:
     """
-    Query ADO for all active PRs in each configured repo.
-    For each PR whose source branch matches the auto/<group>-<target>
-    naming convention, record it in the state file.
+    Query ADO for PRs created by the PAT owner in each configured repo.
 
-    This handles:
-      - PRs previously created by this script but missing from state
-        (e.g. state file was deleted or script was run on another machine)
-      - PRs manually raised using the auto/ branch naming convention
+    Only PRs following the auto/<group>-<target> source branch convention
+    are recorded. PRs raised by other users or with non-auto branch names
+    are intentionally ignored.
 
-    PRs raised manually with completely custom branch names are NOT
-    matched — this is intentional, as there is no reliable way to map
-    an arbitrary branch name to a group without ambiguity.
+    Returns the number of repos that failed, so the caller can decide
+    whether to persist state.
     """
     org_url = global_cfg["azure"]["org_url"]
-    project = global_cfg["azure"]["project"]
 
-    # Initialise ADO connection directly (step logger not appropriate here)
-    credentials = BasicAuthentication("", PAT)
-    connection = Connection(base_url=org_url, creds=credentials)
+    connection = make_connection(org_url)
     git_client = connection.clients.get_git_client()
 
     section("Sync State — querying ADO for active PRs")
 
+    print("  Resolving identity of PAT owner...")
+    try:
+        current_user_id = get_current_user_id(connection)
+        print(f"  ✅ Current user ID : {current_user_id}")
+    except RuntimeError as e:
+        print(f"  ❌ {e}")
+        return 1
+
     repos_to_scan = filter_repos(repos, selected_repos)
     synced = 0
     skipped = 0
+    error_count = 0
 
     for repo_cfg in repos_to_scan:
         repo_name = repo_cfg["name"]
+        project = repo_cfg["project"]
+        ssh_remote_base = repo_cfg["ssh_remote_base"]
         branch_groups = repo_cfg.get("branch_groups", [])
         catch_all = global_cfg["defaults"]["catch_all_branch_prefix"]
         target_branches = filter_branches(
@@ -371,36 +451,47 @@ def sync_state_from_ado(
             selected_branches,
         )
 
-        # All known group names for this repo (including catch_all)
         known_groups = [g["group"] for g in branch_groups] + [catch_all]
 
         subsection(f"Repo : {repo_name}")
+        print(f"  Project        : {project}")
+        print(f"  SSH remote     : {ssh_remote_base}/{repo_name}")
 
         try:
             repo_obj = git_client.get_repository(repo_name, project=project)
         except Exception as e:
             print(f"  ❌ Could not fetch repo '{repo_name}': {e}")
+            error_count += 1
             continue
 
-        # Fetch all active PRs for this repo in one API call
-        criteria = GitPullRequestSearchCriteria(status="active")
+        # Filter to only PRs created by the current user
+        criteria = GitPullRequestSearchCriteria(
+            status="active",
+            creator_id=current_user_id,
+        )
         try:
             active_prs = git_client.get_pull_requests(
                 repo_obj.id, criteria, project=project
             )
         except Exception as e:
             print(f"  ❌ Could not fetch PRs for '{repo_name}': {e}")
+            error_count += 1
             continue
 
         if not active_prs:
-            print(f"  No active PRs found for '{repo_name}'")
+            print(
+                f"  No active PRs created by you found for '{repo_name}'"
+            )
             continue
 
-        print(f"  Found {len(active_prs)} active PR(s) — scanning...")
+        print(
+            f"  Found {len(active_prs)} active PR(s) created by you"
+            f" — scanning for auto/ convention..."
+        )
 
         for pr in active_prs:
-            source = pr.source_ref_name  # refs/heads/auto/IBOR-develop-...
-            target = pr.target_ref_name  # refs/heads/develop
+            source = pr.source_ref_name
+            target = pr.target_ref_name
             target_branch = target.replace("refs/heads/", "")
 
             if target_branch not in target_branches:
@@ -412,9 +503,11 @@ def sync_state_from_ado(
             )
 
             if group is None:
+                # PR was created by this user but not via the auto/ convention
+                # (e.g. manually raised). Silently skip — not an error.
                 print(
-                    f"  ⚠  PR #{pr.pull_request_id} — source branch"
-                    f" '{source}' does not match auto/ convention, skipping"
+                    f"  —  PR #{pr.pull_request_id} source branch '{source}'"
+                    f" does not match auto/ convention — skipping"
                 )
                 skipped += 1
                 continue
@@ -429,15 +522,16 @@ def sync_state_from_ado(
 
             if existing.get("pr_id") == pr.pull_request_id:
                 print(
-                    f"  — PR #{pr.pull_request_id} [{group} → {matched_target}]"
+                    f"  —  PR #{pr.pull_request_id}"
+                    f" [{group} → {matched_target}]"
                     f" already in state, skipping"
                 )
                 skipped += 1
                 continue
 
-            # Write into state
-            state.setdefault(repo_name, {}) \
-                 .setdefault(group, {})[matched_target] = {
+            state.setdefault(repo_name, {}).setdefault(group, {})[
+                matched_target
+            ] = {
                 "branch": source_branch,
                 "pr_id": pr.pull_request_id,
             }
@@ -449,7 +543,11 @@ def sync_state_from_ado(
             )
             synced += 1
 
-    print(f"\n  Sync complete — {synced} recorded, {skipped} skipped")
+    print(
+        f"\n  Sync complete — {synced} recorded, {skipped} skipped,"
+        f" {error_count} repo(s) failed"
+    )
+    return error_count
 
 
 # ── PR Description ────────────────────────────────────────────────────────────
@@ -511,30 +609,35 @@ def get_env() -> dict:
 
 def run(cmd: List[str], cwd: Optional[str] = None) -> str:
     result = subprocess.run(
-        cmd, cwd=cwd, check=True, capture_output=True, text=True, env=get_env()
+        cmd,
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=get_env(),
     )
     return result.stdout.strip()
 
 
-def get_ssh_url(ssh_remote_base: str, repo_name: str) -> str:
-    return f"{ssh_remote_base}/{repo_name}"
-
-
 def clone_or_fetch(repo_name: str, ssh_remote_base: str) -> str:
     local_path = os.path.join(REPOS_ROOT, repo_name)
-    ssh_url = get_ssh_url(ssh_remote_base, repo_name)
+    ssh_url = f"{ssh_remote_base}/{repo_name}"
     if not os.path.exists(local_path):
         step.log(f"Cloning '{repo_name}' via SSH into {local_path}")
         run(["git", "clone", ssh_url, local_path])
         step.ok("Clone successful")
     else:
-        step.log(f"Repo '{repo_name}' exists locally, fetching all remotes...")
+        step.log(
+            f"Repo '{repo_name}' exists locally, fetching all remotes..."
+        )
         run(["git", "fetch", "--all"], cwd=local_path)
         step.ok("Fetch successful")
     return local_path
 
 
-def prepare_branch(local_path: str, base_branch: str, new_branch: str):
+def prepare_branch(
+    local_path: str, base_branch: str, new_branch: str
+):
     step.log(f"Checking out '{base_branch}'")
     run(["git", "checkout", base_branch], cwd=local_path)
     step.log(f"Pulling latest from origin/{base_branch}")
@@ -579,7 +682,9 @@ def has_changes(repo_local_path: str) -> bool:
     return bool(status.strip())
 
 
-def commit_and_push(repo_local_path: str, branch: str, message: str):
+def commit_and_push(
+    repo_local_path: str, branch: str, message: str
+):
     step.log("Staging all changes (git add .)")
     run(["git", "add", "."], cwd=repo_local_path)
     step.log(f"Committing with message: '{message}'")
@@ -597,8 +702,7 @@ _clients: Dict[str, object] = {}
 def get_git_client(org_url: str):
     if "git" not in _clients:
         step.log("Initializing Azure DevOps connection...")
-        credentials = BasicAuthentication("", PAT)
-        connection = Connection(base_url=org_url, creds=credentials)
+        connection = make_connection(org_url)
         _clients["git"] = connection.clients.get_git_client()
         _clients["wit"] = connection.clients.get_work_item_tracking_client()
         step.ok("Azure DevOps client ready")
@@ -634,7 +738,9 @@ def link_work_items_to_pr(
         return
     repo = git_client.get_repository(repo_name, project=project)
     pr = git_client.get_pull_request(
-        repository_id=repo.id, pull_request_id=pr_id, project=project
+        repository_id=repo.id,
+        pull_request_id=pr_id,
+        project=project,
     )
     pr_artifact_id = pr.artifact_id
     for wid in work_item_ids:
@@ -670,7 +776,8 @@ def raise_pr(
     repo = git_client.get_repository(repo_name, project=project)
     reviewer_refs = (
         [IdentityRefWithVote(id=guid) for guid in reviewers]
-        if reviewers else []
+        if reviewers
+        else []
     )
     pr_payload = GitPullRequestToCreate(
         title=title,
@@ -706,8 +813,13 @@ def print_dry_run_plan(
     template_source: str,
     branch_groups: List[dict],
     repo_cfg: dict,
+    project: str,
+    ssh_remote_base: str,
 ):
-    print(f"\n  Template source : {template_source}")
+    print(f"\n  Project         : {project}")
+    print(f"  SSH remote      : {ssh_remote_base}/{repo_name}")
+    print(f"  Template source : {template_source}")
+
     for base_branch in target_branches:
         subsection(f"DRY RUN | {repo_name} → {base_branch}")
         i = 0
@@ -738,7 +850,9 @@ def print_dry_run_plan(
                 )
 
             i += 1
-            print(f"      {i}. Domain    : {mapped_domain} (will be checked)")
+            print(
+                f"      {i}. Domain    : {mapped_domain} (will be checked)"
+            )
 
             i += 1
             print(f"      {i}. Files     :")
@@ -779,6 +893,7 @@ def process_group(
     state: dict,
     git_client,
     global_cfg: dict,
+    project: str,
     reviewers: List[str],
     domain_map: Dict[str, str],
     template: Optional[str],
@@ -786,7 +901,6 @@ def process_group(
     repo_cfg: dict,
 ):
     org_url = global_cfg["azure"]["org_url"]
-    project = global_cfg["azure"]["project"]
 
     state_entry = (
         state.setdefault(repo_name, {})
@@ -800,7 +914,7 @@ def process_group(
     group_cfg = get_group_cfg(group, branch_groups)
     work_items = collect_work_items(files, group_cfg, repo_cfg)
 
-    # ── Step 1: determine branch strategy ────────────────────────────────────
+    # ── Step 1: determine branch strategy ─────────────────────────────────────
     step.log("Checking for existing open PR in state...")
     if existing_branch and existing_pr_id:
         if is_pr_still_open(git_client, project, repo_name, existing_pr_id):
@@ -808,7 +922,9 @@ def process_group(
                 f"Open PR #{existing_pr_id} found on '{existing_branch}'"
                 f" — will amend"
             )
-            checkout_existing_branch(local_path, existing_branch, base_branch)
+            checkout_existing_branch(
+                local_path, existing_branch, base_branch
+            )
             is_amendment = True
         else:
             step.log(
@@ -850,12 +966,17 @@ def process_group(
     )
     commit_and_push(local_path, new_branch, commit_msg)
 
-    # ── Step 5: raise PR or log amendment + link work items ──────────────────
+    # ── Step 5: raise PR or log amendment + link work items ───────────────────
     if not is_amendment:
         step.log("Building PR description...")
         description = build_pr_description(
-            template, group, domain_map,
-            files, repo_name, base_branch, timestamp,
+            template,
+            group,
+            domain_map,
+            files,
+            repo_name,
+            base_branch,
+            timestamp,
         )
         mapped_domain = domain_map.get(group, "none")
         step.log(f"Domain checkbox auto-checked : [{mapped_domain}]")
@@ -865,9 +986,15 @@ def process_group(
             f"[AUTO] {repo_name}/{group} → {base_branch} | {timestamp}"
         )
         pr_id = raise_pr(
-            git_client, project, repo_name,
-            new_branch, base_branch,
-            pr_title, org_url, reviewers, description,
+            git_client,
+            project,
+            repo_name,
+            new_branch,
+            base_branch,
+            pr_title,
+            org_url,
+            reviewers,
+            description,
         )
         state[repo_name][group][base_branch] = {
             "branch": new_branch,
@@ -880,8 +1007,13 @@ def process_group(
                 f" to PR #{pr_id}: {work_items}"
             )
             link_work_items_to_pr(
-                git_client, get_wit_client(),
-                project, repo_name, pr_id, work_items, org_url,
+                git_client,
+                get_wit_client(),
+                project,
+                repo_name,
+                pr_id,
+                work_items,
+                org_url,
             )
         else:
             step.log("No work items configured — skipping link")
@@ -896,8 +1028,13 @@ def process_group(
                 f" to existing PR #{existing_pr_id}: {work_items}"
             )
             link_work_items_to_pr(
-                git_client, get_wit_client(),
-                project, repo_name, existing_pr_id, work_items, org_url,
+                git_client,
+                get_wit_client(),
+                project,
+                repo_name,
+                existing_pr_id,
+                work_items,
+                org_url,
             )
         else:
             step.log("No work items configured — skipping link")
@@ -916,10 +1053,11 @@ def process_repo(
     args: argparse.Namespace,
 ):
     repo_name = repo_cfg["name"]
+    project = repo_cfg["project"]
+    ssh_remote_base = repo_cfg["ssh_remote_base"]
     files = repo_cfg.get("files", [])
     branch_groups = repo_cfg.get("branch_groups", [])
     catch_all = global_cfg["defaults"]["catch_all_branch_prefix"]
-    ssh_remote_base = global_cfg["git"]["ssh_remote_base"]
     reviewers = repo_cfg.get("reviewers", [])
     domain_map = repo_cfg.get("domain_map", {})
 
@@ -928,9 +1066,11 @@ def process_repo(
     )
 
     section(f"Repo : {repo_name}")
+    step.log(f"Project        : {project}")
+    step.log(f"SSH remote     : {ssh_remote_base}/{repo_name}")
 
     template, template_source = resolve_template(repo_cfg, global_cfg)
-    step.log(f"PR template : {template_source}")
+    step.log(f"PR template    : {template_source}")
 
     if not files:
         print("  ⚠  No files configured, skipping.")
@@ -958,9 +1098,17 @@ def process_repo(
 
     if args.dry_run:
         print_dry_run_plan(
-            repo_name, grouped_files, target_branches,
-            state, reviewers, domain_map,
-            template_source, branch_groups, repo_cfg,
+            repo_name,
+            grouped_files,
+            target_branches,
+            state,
+            reviewers,
+            domain_map,
+            template_source,
+            branch_groups,
+            repo_cfg,
+            project,
+            ssh_remote_base,
         )
         return
 
@@ -976,11 +1124,21 @@ def process_repo(
             group_header(group)
             step.reset()
             process_group(
-                repo_name, group, group_file_list,
-                base_branch, timestamp, local_path,
-                state, git_client, global_cfg,
-                reviewers, domain_map, template,
-                branch_groups, repo_cfg,
+                repo_name,
+                group,
+                group_file_list,
+                base_branch,
+                timestamp,
+                local_path,
+                state,
+                git_client,
+                global_cfg,
+                project,
+                reviewers,
+                domain_map,
+                template,
+                branch_groups,
+                repo_cfg,
             )
             group_footer(group)
 
@@ -991,6 +1149,11 @@ def process_repo(
 def main():
     args = parse_args()
     config = load_config()
+
+    # Hard stop — validate config before doing anything else
+    if not validate_config(config):
+        raise SystemExit(1)
+
     state = load_state()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -1006,21 +1169,32 @@ def main():
     repos = filter_repos(config["repos"], args.repos)
     print(f"\n  Repos to process : {len(repos)}")
     for r in repos:
-        print(f"    • {r['name']}")
+        print(f"    • {r['name']}  (project: {r['project']})")
 
-    # ── Sync state mode — query ADO, write state, exit ────────────────────────
+    # ── Sync state mode ───────────────────────────────────────────────────────
     if args.sync_state:
-        sync_state_from_ado(
+        errors = sync_state_from_ado(
             config["repos"],
             config,
             state,
             args.repos,
             args.branches,
         )
-        save_state(state)
         print("\n" + "═" * 60)
-        print("  State synced. Run without --sync-state to raise PRs.")
+        if errors == 0:
+            save_state(state)
+            print("  State synced. Run without --sync-state to raise PRs.")
+        else:
+            print(
+                f"  ⚠  Sync finished with {errors} error(s)."
+                f" State NOT saved to avoid overwriting good data."
+            )
+            print(
+                "  Fix the repo name / project / permissions and retry."
+            )
         print("═" * 60 + "\n")
+        if errors:
+            raise SystemExit(1)
         return
 
     # ── Normal / dry-run mode ─────────────────────────────────────────────────
